@@ -1,0 +1,7 @@
+Flask>=3.0,<4
+requests>=2.31,<3
+yfinance>=0.2.50,<2
+numpy>=1.26,<3
+scipy>=1.11,<2
+pandas>=2.0,<3
+pytest>=8,<9
