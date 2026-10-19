@@ -37,6 +37,16 @@ python3 -m pytest -q
 
 macOS 定时同步运行 `sh scripts/install-launchagent.sh` 安装到 `~/Library/LaunchAgents/`。模板设本机每天 09:00 检查完整交易日，适合中国时区；其他时区请调整 `StartCalendarInterval`。任务会在启动时和每日重复运行，账本重放幂等。应用启动时可用 `sh run.sh`，后台会自动补齐遗漏交易日，页面先展示上次完整结果。建议在 Theta Terminal 已启动并登录后启用定时任务。
 
+## GitHub Pages 概览
+
+GitHub Pages 没有本机 Flask 与 SQLite 服务，因此项目根地址会自动跳转到 `#overview`，并使用 `assets/overview-snapshot.json` 展示与本地“收益概览”相同的页面结构、图表和已归档数据。每次需要发布最新概览前，先在本机完成行情同步与重放，再执行：
+
+```bash
+python3 scripts/export-pages-snapshot.py
+```
+
+随后提交并推送 `assets/overview-snapshot.json`。本地 `localhost:10020` 始终优先读取实时 API，不使用该快照。
+
 本机项目位于 `Documents` 时，macOS 可能拒绝 launchd 后台进程读取项目文件。安装器会报告首次退出码，错误日志位于 `data/launch.err.log`。出现 `Operation not permitted` 时，需要在系统“隐私与安全性 → 文件与文件夹 / 完全磁盘访问权限”为执行任务的 shell 授权，或将项目运行副本放在非受保护目录后重新安装。
 
 ## 模型边界
