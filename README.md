@@ -1,4 +1,4 @@
-# 天府退休计划 v1.4
+# 天府退休计划 v1.5
 
 独立 Flask + 原生 JS 的 **日终报价模拟** 系统。2026-01-01 建账，以 250,000 美元启动；首个 NYSE 交易日买入 BOXX。默认服务 `http://localhost:10020/#overview`。macOS 普通用户无法绑定原计划的 1002 特权端口。
 
@@ -14,7 +14,7 @@ python3 run.py
 
 日常可直接运行 `sh run.sh`；macOS 可双击 `启动天府退休计划.command`。启动器参考原项目的“一键运行并打开浏览器”流程，依赖缺失时才安装，并打开 `http://localhost:10020/#overview`。
 
-项目文档：[架构](ARCHITECTURE.md) · [页面设计](DESIGN.md) · [技术说明](TECHNICAL.md) · [数据源核验](DATA_SOURCES.md) · [变更记录](CHANGELOG.md)。前端按 `js/common.js`、`js/tabs/*.js` 和 `js/main.js` 拆分，浏览器直接加载，无构建步骤。
+项目文档：[策略规范](STRATEGY.md) · [架构](ARCHITECTURE.md) · [页面设计](DESIGN.md) · [技术说明](TECHNICAL.md) · [数据源核验](DATA_SOURCES.md) · [变更记录](CHANGELOG.md)。前端按 `js/common.js`、`js/tabs/*.js` 和 `js/main.js` 拆分，浏览器直接加载，无构建步骤。
 
 免费期权报价需要本机已登录的 [Theta Terminal](https://thetadata.net/docs/Articles/Getting-Started/Getting-Started.html)，默认 `http://127.0.0.1:25503`。项目已安装全局 Temurin Java 21 和 Terminal v3；从 ThetaData 用户门户创建 API key 后，复制 `scripts/theta.env.example` 为 `runtime/theta/.env` 并填入密钥，再运行 `sh scripts/start-theta.sh`。启动器会优先使用全局 Java 21。可用 `THETA_URL` 覆盖。Theta 免费层历史窗口滚动，越早回填越能保留完整 2026 年报价。BOXX、SPY、QQQM、汇率与短期利率的默认适配器使用 Yahoo Finance；VIX 使用 Cboe 官方历史 CSV。各条记录注明来源。历史 Delta 使用真实 bid/ask 中价反推隐含波动率，再通过含股息 CRR 美式期权树计算；不是交易所提供的真实 Greeks。
 

@@ -267,6 +267,19 @@ def test_contract_history_rollup_and_backtest_windows():
     assert comparison['status']=='ready'
     assert comparison['strategy_return']==pytest.approx(.1)
     assert comparison['benchmark_return']==pytest.approx(.01)
+    assert comparison['excess_return']==pytest.approx(.09)
+    with_withdrawals=strategy_benchmark_comparison(
+        [{'date':'2026-01-02','nav':100,'distributions_usd':0},
+         {'date':'2026-01-05','nav':60,'distributions_usd':50},
+         {'date':'2026-01-06','nav':66,'distributions_usd':50}],
+        [{'date':'2026-01-02','close':10,'dividend':0},
+         {'date':'2026-01-05','close':11,'dividend':0},
+         {'date':'2026-01-06','close':12.1,'dividend':0}])
+    assert with_withdrawals['strategy_return']==pytest.approx(.16)
+    assert with_withdrawals['benchmark_return']==pytest.approx(.16)
+    assert with_withdrawals['excess_return']==pytest.approx(0)
+    assert with_withdrawals['benchmark_final_nav']==pytest.approx(66)
+    assert with_withdrawals['benchmark_withdrawals_usd']==pytest.approx(50)
 
 
 def test_api_empty_state(db,monkeypatch):
@@ -276,6 +289,7 @@ def test_api_empty_state(db,monkeypatch):
     client=server.app.test_client()
     assert client.get('/').status_code==200
     assert '模拟复盘' in client.get('/').text
+    assert '更新模拟' in client.get('/').text
     assert client.get('/assets/style.css').status_code==200
     assert client.get('/js/app.js').status_code==200
     for module in ['/js/main.js','/js/common.js','/js/tabs/returns.js',
@@ -285,7 +299,99 @@ def test_api_empty_state(db,monkeypatch):
         response=client.get(path)
         assert response.status_code==200
         assert response.json['as_of'] is None
-        assert response.json['rule_version']=='tianfu-v1.4.0'
+        assert response.json['rule_version']=='tianfu-v1.5.0'
+
+
+def test_simulation_update_syncs_then_replays_and_reports_partial_sources(db,monkeypatch):
+    import server
+    server.app.config['TESTING']=True
+    server.app.config['DATABASE']=str(db.execute('PRAGMA database_list').fetchone()[2])
+    calls=[]
+    monkeypatch.setattr(server,'ensure_theta_terminal',lambda:{'status':'already_running','message':'Theta Terminal 已连接。'})
+    monkeypatch.setattr(server,'latest_publishable_session',lambda:date(2026,1,5))
+    monkeypatch.setattr(server,'sync_all',lambda connection,start,end: calls.append(('sync',start,end)) or ['Theta unavailable'])
+    monkeypatch.setattr(server,'replay',lambda connection,until: calls.append(('replay',until)) or
+                        {'complete_through':'2026-01-02','events':4,'gaps':1})
+
+    response=server.app.test_client().post('/api/simulation/update')
+
+    assert response.status_code==200
+    assert response.content_type=='application/json'
+    assert calls==[('sync',date(2025,1,1),date(2026,1,5)),('replay','2026-01-05')]
+    assert response.json['status']=='updated_with_warnings'
+    assert response.json['message_level']=='warning'
+    assert response.json['as_of_before'] is None
+    assert response.json['as_of_after']=='2026-01-02'
+    assert response.json['replay']['events']==4
+    assert '更新完成' in response.json['message']
+
+
+def test_simulation_update_reports_when_missing_quotes_prevent_an_advance(db,monkeypatch):
+    import server
+    server.app.config['TESTING']=True
+    server.app.config['DATABASE']=str(db.execute('PRAGMA database_list').fetchone()[2])
+    db.execute("INSERT INTO daily_nav VALUES('2026-01-02',0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,'test')")
+    upsert_quote(db,'2026-01-02','SPY:2026-02-20:P:100','2026-02-20',100,'P',1,1.1,'test','EOD')
+    db.commit()
+    monkeypatch.setattr(server,'ensure_theta_terminal',lambda:{'status':'already_running','message':'Theta Terminal 已连接。'})
+    monkeypatch.setattr(server,'latest_publishable_session',lambda:date(2026,1,5))
+    monkeypatch.setattr(server,'sync_all',lambda *_args:['Theta 2026-01-05: connection refused'])
+    monkeypatch.setattr(server,'replay',lambda *_args,**_kwargs:{'complete_through':'2026-01-02','events':4,'gaps':1})
+
+    response=server.app.test_client().post('/api/simulation/update')
+
+    assert response.status_code==200
+    assert response.json['status']=='blocked'
+    assert response.json['message_level']=='warning'
+    assert '模拟未更新：仍截至 2026-01-02，目标为 2026-01-05' in response.json['message']
+    assert 'Theta Terminal 未连接' in response.json['message']
+
+
+def test_update_starts_local_theta_before_syncing(db,monkeypatch):
+    import server
+    server.app.config['TESTING']=True
+    server.app.config['DATABASE']=str(db.execute('PRAGMA database_list').fetchone()[2])
+    calls=[];ready=iter([False,True])
+    monkeypatch.setattr(server,'theta_terminal_ready',lambda:next(ready))
+    monkeypatch.setattr(server.subprocess,'Popen',lambda command,**kwargs:calls.append((command,kwargs)))
+
+    result=server.ensure_theta_terminal(timeout=1)
+
+    assert result['status']=='started'
+    assert result['message']=='Theta Terminal 已启动并连接。'
+    assert calls[0][0]==[str(server.THETA_START_SCRIPT)]
+    assert calls[0][1]['cwd']==server.ROOT
+
+
+def test_simulation_update_stops_before_replay_when_theta_cannot_start(db,monkeypatch):
+    import server
+    server.app.config['TESTING']=True
+    server.app.config['DATABASE']=str(db.execute('PRAGMA database_list').fetchone()[2])
+    monkeypatch.setattr(server,'latest_publishable_session',lambda:date(2026,1,5))
+    monkeypatch.setattr(server,'ensure_theta_terminal',lambda:{'status':'unavailable','message':'Theta Terminal 未能启动。'})
+    monkeypatch.setattr(server,'sync_all',lambda *_args:pytest.fail('should not sync without Theta'))
+    monkeypatch.setattr(server,'replay',lambda *_args,**_kwargs:pytest.fail('should not replay without Theta'))
+
+    response=server.app.test_client().post('/api/simulation/update')
+
+    assert response.status_code==200
+    assert response.json['status']=='blocked'
+    assert 'Theta Terminal 未能启动' in response.json['message']
+
+
+def test_simulation_update_rejects_a_concurrent_catch_up(db):
+    import server
+    server.app.config['TESTING']=True
+    server.app.config['DATABASE']=str(db.execute('PRAGMA database_list').fetchone()[2])
+    assert server.SIMULATION_UPDATE_LOCK.acquire(blocking=False)
+    try:
+        response=server.app.test_client().post('/api/simulation/update')
+    finally:
+        server.SIMULATION_UPDATE_LOCK.release()
+
+    assert response.status_code==409
+    assert response.content_type=='application/json'
+    assert response.json['error']=='simulation update already in progress'
 
 
 def test_market_api_shows_real_bars_without_simulation(db):

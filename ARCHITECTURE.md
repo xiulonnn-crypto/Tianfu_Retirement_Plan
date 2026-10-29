@@ -30,7 +30,7 @@ flowchart LR
 | `strategy/engine.py` | 备兑额度、阶梯、止盈、接货、房东模式、保险、分红、逐日盯市 |
 | `strategy/db.py` | SQLite 模式与原始行情写入接口 |
 | `manage.py` | 初始化、回填、每日增量同步、重放及状态检查 |
-| `server.py` | 启动后台补漏与五个只读 API |
+| `server.py` | 启动后台补漏、行情 API 与手动更新；手动更新会按需启动本机 Theta Terminal 并等待连接 |
 | `js/common.js`、`js/tabs/*.js` | 公共格式化与四个页面模块，浏览器直接加载 ES modules |
 | `js/main.js` | Hash 导航、数据状态提示和页面装配 |
 
@@ -45,6 +45,7 @@ flowchart LR
 | `/api/trades` | `view=orders` 汇总期权与股票持仓批次的开平仓，`view=events` 返回分页成交、指派、提取及跳过信号 |
 | `/api/review` | 策略事件计数、欠额和数据缺口 |
 | `/api/data-health` | 各标的覆盖日期、期权覆盖日期及过期状态 |
+| `POST /api/simulation/update` | 拉取缺失的最新行情并原子化重放本地模拟账本；返回更新范围、重放结果与未更新的数据源 |
 | `/api/backtests/2` | 独立两年模型回测指标、净值、回撤、月度收益归因及 QQQ/QQQI 链式基准 |
 | `/api/backtests/2/trades` | 独立模型回测事件及每笔模型报价参数；`view=orders` 返回期权和股票的开平仓订单汇总 |
 

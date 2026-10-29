@@ -1,21 +1,90 @@
 import json
 import os
+import subprocess
 import threading
 import sys
+import time
 from datetime import date,datetime,timedelta
+from pathlib import Path
+from urllib.parse import urlparse
+import requests
 from flask import Flask, jsonify, request, send_from_directory
 from strategy import RULE_VERSION
 from strategy.db import connect
 from strategy.engine import replay
 from strategy.calendar import latest_publishable_session
-from strategy.providers import sync_all
+from strategy.providers import THETA_BASE, sync_all
 from strategy.backtest import load_backtest
 
 ROOT=os.path.dirname(os.path.abspath(__file__))
 app=Flask(__name__,static_folder='assets')
+SIMULATION_UPDATE_LOCK=threading.Lock()
+THETA_START_SCRIPT=Path(ROOT)/'scripts'/'start-theta.sh'
+
+
+def theta_terminal_ready():
+    """Return whether the configured Terminal accepts local HTTP connections."""
+    try:
+        # Terminal intentionally answers 410 at its root for v3 clients; any
+        # HTTP response proves the process is up before requesting EOD data.
+        requests.get(f'{THETA_BASE}/',timeout=2)
+        return True
+    except requests.RequestException:
+        return False
+
+
+def ensure_theta_terminal(timeout=45):
+    """Start the configured local Terminal and wait until its HTTP API is ready.
+
+    The launcher reads its API key only from the local-only runtime env file.
+    Never launch a process for a remote/custom Theta endpoint.
+    """
+    if theta_terminal_ready():
+        return {'status':'already_running','message':'Theta Terminal 已连接。'}
+    endpoint=urlparse(THETA_BASE)
+    if endpoint.hostname not in {'127.0.0.1','localhost','::1'}:
+        return {'status':'unavailable','message':'配置的 Theta Terminal 不在本机，无法自动启动。'}
+    if not THETA_START_SCRIPT.is_file():
+        return {'status':'unavailable','message':'未找到 Theta Terminal 启动脚本。'}
+    subprocess.Popen([str(THETA_START_SCRIPT)],cwd=ROOT,stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+    deadline=time.monotonic()+timeout
+    while time.monotonic()<deadline:
+        if theta_terminal_ready():
+            return {'status':'started','message':'Theta Terminal 已启动并连接。'}
+        time.sleep(.5)
+    return {'status':'unavailable','message':'Theta Terminal 未能在 45 秒内启动并登录。'}
 
 
 def dbconn():return connect(app.config.get('DATABASE'))
+
+
+def update_simulation(auto_start_theta=False):
+    """Fetch missing market inputs, then atomically rebuild the simulated ledger.
+
+    Replaying is intentionally deterministic and replaces only derived ledger
+    tables.  Raw bars and quotes remain the archived source of truth, so a
+    browser click can never create a real order or publish a partial day.
+    """
+    with dbconn() as db:
+        last=db.execute('SELECT MAX(date) FROM daily_nav').fetchone()[0]
+        start=date.fromisoformat(last) if last else date(2025,1,1)
+        end=latest_publishable_session()
+        theta={'status':'not_needed','message':'模拟账本已是最新。'}
+        if auto_start_theta and start<end:
+            theta=ensure_theta_terminal()
+            if theta['status']=='unavailable':
+                return {'sync_start':start.isoformat(),'target_date':end.isoformat(),
+                        'as_of_before':last,'as_of_after':last,'option_as_of':db.execute(
+                            'SELECT MAX(date) FROM option_quotes').fetchone()[0],
+                        'errors':[theta['message']],'replay':{'complete_through':last,'events':0,'gaps':0},
+                        'theta':theta}
+        errors=sync_all(db,start,end) if start<=end else []
+        result=replay(db,until=end.isoformat())
+        quote_as_of=db.execute('SELECT MAX(date) FROM option_quotes').fetchone()[0]
+    return {'sync_start':start.isoformat(),'target_date':end.isoformat(),
+            'as_of_before':last,'as_of_after':result['complete_through'],
+            'option_as_of':quote_as_of,'errors':errors,'replay':result,'theta':theta}
 
 
 def asdict(row):return dict(row) if row else None
@@ -260,18 +329,30 @@ def model_backtest_payload(years, include_events=False):
 
 
 def strategy_benchmark_comparison(nav_rows, benchmark_rows):
-    """Align strategy total wealth with QQQI total return on common dates."""
+    """Compare total wealth after applying the strategy's cash withdrawals to both legs."""
     if not nav_rows or not benchmark_rows:return {'symbol':'QQQI','status':'missing','series':[],'drawdowns':[]}
     benchmark={row['date']:row for row in indexed_total_return(benchmark_rows)}
     common=[row for row in nav_rows if row['date'] in benchmark]
     if len(common)<2:return {'symbol':'QQQI','status':'missing','series':[],'drawdowns':[]}
     start_wealth=float(common[0]['nav'])+float(common[0]['distributions_usd'])
-    start_benchmark=float(benchmark[common[0]['date']]['value'])
+    previous_benchmark=float(benchmark[common[0]['date']]['value'])
+    previous_distributions=float(common[0]['distributions_usd'])
+    benchmark_nav=start_wealth
+    benchmark_withdrawals=0.
     series=[]
     for row in common:
         wealth=float(row['nav'])+float(row['distributions_usd'])
+        benchmark_value=float(benchmark[row['date']]['value'])
+        if series:
+            benchmark_nav*=benchmark_value/previous_benchmark
+            withdrawal=float(row['distributions_usd'])-previous_distributions
+            benchmark_nav-=withdrawal
+            benchmark_withdrawals+=withdrawal
+        benchmark_wealth=benchmark_nav+benchmark_withdrawals
         series.append({'date':row['date'],'strategy':round(wealth/start_wealth*100,8),
-                       'benchmark':round(float(benchmark[row['date']]['value'])/start_benchmark*100,8)})
+                       'benchmark':round(benchmark_wealth/start_wealth*100,8)})
+        previous_benchmark=benchmark_value
+        previous_distributions=float(row['distributions_usd'])
     strategy_dd=drawdowns([{'date':x['date'],'value':x['strategy']} for x in series])
     benchmark_dd=drawdowns([{'date':x['date'],'value':x['benchmark']} for x in series])
     return {'symbol':'QQQI','status':'ready','start_date':series[0]['date'],'end_date':series[-1]['date'],
@@ -279,9 +360,12 @@ def strategy_benchmark_comparison(nav_rows, benchmark_rows):
                                           for s,b in zip(strategy_dd,benchmark_dd)],
             'strategy_return':round(series[-1]['strategy']/100-1,8),
             'benchmark_return':round(series[-1]['benchmark']/100-1,8),
-            'excess_return':round(series[-1]['strategy']/series[-1]['benchmark']-1,8),
+            'excess_return':round(series[-1]['strategy']/100-series[-1]['benchmark']/100,8),
             'strategy_max_drawdown':round(min(x['value'] for x in strategy_dd),8),
-            'benchmark_max_drawdown':round(min(x['value'] for x in benchmark_dd),8)}
+            'benchmark_max_drawdown':round(min(x['value'] for x in benchmark_dd),8),
+            'initial_total_wealth':round(start_wealth,8),
+            'benchmark_final_nav':round(benchmark_nav,8),
+            'benchmark_withdrawals_usd':round(benchmark_withdrawals,8)}
 
 
 def backtest_windows(nav_rows, benchmark_rows=()):
@@ -471,6 +555,50 @@ def health():
         return jsonify(response)
 
 
+@app.post('/api/simulation/update')
+def simulation_update():
+    """Run the local, end-of-day simulation update requested from the dashboard."""
+    if not SIMULATION_UPDATE_LOCK.acquire(blocking=False):
+        return jsonify({'error':'simulation update already in progress'}),409
+    try:
+        update=update_simulation(auto_start_theta=True)
+    except Exception as exc:
+        app.logger.exception('simulation update failed')
+        return jsonify({'error':'simulation update failed','detail':str(exc)}),502
+    finally:
+        SIMULATION_UPDATE_LOCK.release()
+    before=update['as_of_before']
+    complete=update['as_of_after']
+    target=update['target_date']
+    advanced=bool(complete and (not before or complete>before))
+    if advanced:
+        status='updated'
+        level='success'
+        message=f'更新完成：模拟从 {before or "待回填"} 推进至 {complete}（目标 {target}）。'
+        if update['errors']:
+            status='updated_with_warnings';level='warning'
+            message+=f' 仍有 {len(update["errors"])} 个行情来源或交易日未更新。'
+    elif complete==target:
+        status='current';level='info'
+        message=f'模拟已是最新：截至 {complete}。'
+    else:
+        status='blocked';level='warning'
+        message=(f'模拟未更新：仍截至 {complete or "待回填"}，目标为 {target}。'
+                 f'缺少 SPY 日终期权报价（当前截至 {update["option_as_of"] or "无"}）。')
+        theta_error=next((error for error in update['errors'] if error.startswith('Theta ')),None)
+        if update.get('theta',{}).get('status')=='unavailable':
+            message+=f" {update['theta']['message']}"
+        elif theta_error and any(marker in theta_error.lower() for marker in ('connection refused','failed to establish','max retries exceeded')):
+            message+=' Theta Terminal 未连接；请启动并登录后再次点击更新。'
+        elif theta_error:
+            message+=' Theta 日终报价同步失败；请检查 Terminal 状态后再次点击更新。'
+        elif update['errors']:
+            message+=f' {len(update["errors"])} 个行情来源或交易日未更新；请排除数据源问题后重试。'
+        else:
+            message+=' 等待完整报价归档后再试。'
+    return jsonify({'status':status,'message_level':level,'message':message,**update})
+
+
 @app.get('/api/market')
 def market():
     """Archived market observations; never mixed with simulated account returns."""
@@ -495,13 +623,17 @@ def market():
 
 
 def catch_up():
-    with dbconn() as db:
-        last=db.execute('SELECT MAX(date) FROM daily_nav').fetchone()[0]
-        start=date.fromisoformat(last) if last else date(2025,1,1)
-        end=latest_publishable_session()
-        if start<=end:
-            for error in sync_all(db,start,end):print('DATA ERROR:',error,file=sys.stderr)
-        replay(db,until=end.isoformat())
+    # Startup catch-up and an explicit browser update share raw inputs and
+    # derived tables.  Never let them overlap on the same SQLite database.
+    if not SIMULATION_UPDATE_LOCK.acquire(blocking=False):
+        return
+    try:
+        update=update_simulation(auto_start_theta=False)
+        for error in update['errors']:print('DATA ERROR:',error,file=sys.stderr)
+    except Exception:
+        app.logger.exception('startup simulation catch-up failed')
+    finally:
+        SIMULATION_UPDATE_LOCK.release()
 
 
 if __name__=='__main__':
